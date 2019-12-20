@@ -1,0 +1,262 @@
+---
+title: "Star Results Gathering"
+author: "James Monks"
+date: "17/07/2019"
+output: html_document
+---
+
+This document is to examine how accurate the predictions made by the starensemble method are in comparison to other methods. This will be done through an evaluation framework that essentially treats some observations as missing and predictions are made for them. This evaluation will be repeated to ensure the results are reproducible. 
+
+First the nature and structure of the data will be analysed, followed by an example of evaluation. This evaluation will then be repeated a number of times to ensure reproducibility of results.
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+# library(starensemble)
+weather <- readRDS("data-raw/weather.RData")
+
+weather <- weather %>% filter(year >= 1990)
+
+
+```
+
+
+## Pollution Data
+The data that is to be used in the evaluation of the starensemble model is the pollution levels of different monitoring stations around Victoria. This data contains spatial elements `lon` and `lat` referring to longitude and latitude, along with the temporal element `date_time`. This can be thought of as the background contextual data that is used to analyse specific events such as asthma. The variables that are of interest here are those that are specific measures of pollutants in the air such as max_temperature, max_temperature etc along with proxy variables such as aqi and visibility reduction.
+
+### Data Structure
+The numeric variables observing concentration of pollutants is highly right skewed as seen below.
+```{r}
+skimr::skim(weather, max_temperature)
+```
+
+This implies that there are some instances in which the air was very polluted in some of these areas, however in most cases it was comparatively low.
+
+## Evaluation
+### Method
+The evaluation of this method will consist of taking a set of monitoring stations and treating them as unobserved values. The starensemble method will then be used to predict for these locations at given times. The predictions will then be compared to the actual values to evaluate the accuracy. This process will be repeated taking different stations and different times to ensure that an accurate figure for accuracy is produced. 
+
+### Setup
+A list of station IDs needs to be collected initally to leave out of the analysis. There are 10 stations in the data and as such 3 stations will be left out and used as comparisons.
+```{r}
+excluded_stations <- weather %>% 
+  pull(name) %>% 
+  unique() %>% 
+  sample(20)
+```
+
+In addition to the list of stations, a collection of dates and times needs to be gathered for the prediction. These times wont be left out in the prediction process (as all times for each of the selected stations have already been left out), but they are needed to define a preciese coordinate in space and time for prediction to take place.
+
+```{r}
+sample_times <- weather %>% 
+  pull(date_time) %>% 
+  unique() %>% 
+  sample(200)
+```
+
+
+Now a dataframe can be constructed containing the points for comparison. This is done by randomly assigning a station to each time and then joining the values from the original data set. Comparison points that have NA values (for pollutant of interest) are then filtered to leave a clean comparison set. In this case `max_temperature` is being used as the pollutant of interest.
+
+```{r}
+comparison_data <- tibble(date_time = sample_times) %>% 
+  mutate(name = sample(excluded_stations, nrow(.), replace = TRUE)) %>% 
+  left_join(weather, by = c("date_time", "name")) %>% 
+  select(date_time, lon, lat, name, max_temperature) %>% 
+  filter(is.na(max_temperature) == FALSE)
+```
+
+After the stations for exclusion have been identified and the comparison data set has been created, a filtered original data set needs to be established. 
+
+```{r}
+filtered_pollution <- weather %>% 
+  filter(!(name %in% excluded_stations))
+```
+
+### Application
+* Data has been established
+* Starensemble partitions will be created
+* Partitions will be modelled
+
+
+First a single point will be predicted for.
+```{r}
+first_point <- slice(comparison_data, 5)
+partitions <- filtered_pollution %>% 
+  create_partition(first_point$date_time, first_point$lon, first_point$lat)
+```
+
+```{r}
+models <- partitions %>% 
+  model_partitions(target = max_temperature)
+
+predictions <- models %>% 
+  predict_models() %>% 
+  flatten() %>% 
+  flatten_df() 
+final_pred <- weighted.mean(predictions$prediction, w = predictions$weight, na.rm = TRUE)
+actual <- first_point$max_temperature
+c("Actual" = actual, "Predicted" = final_pred)
+```
+
+
+
+
+## Repeating Predictions
+
+* Take the comparison data list
+* Use `pmap` to iterate rowwise through this.
+
+```{r}
+pb <- progress::progress_bar$new(total = nrow(comparison_data))
+partition_list <- comparison_data %>% 
+  pmap(~{
+    pb$tick()
+    create_partition(filtered_pollution, ..1, ..2, ..3)
+  })
+```
+
+```{r}
+model_list <- partition_list %>% 
+  map(~model_partitions(.x, target = max_temperature, optim_span = FALSE))
+
+prediction_list <- model_list %>% 
+  map(~{
+    .x %>% 
+      predict_models() %>% 
+      flatten() %>% 
+      flatten_df() 
+  })
+
+final_prediction_list <- prediction_list %>% 
+  map_dbl(~{
+    weighted.mean(.x$prediction, w = .x$weight, na.rm = TRUE)
+  })
+
+actual <- comparison_data$max_temperature
+```
+
+
+```{r}
+library(magrittr)
+comparison_table <- tibble(
+  actual = actual, 
+  prediction = final_prediction_list
+) %>% 
+  mutate(difference = abs(actual-prediction))
+
+
+mae <- mean(comparison_table$difference, na.rm = TRUE)
+mae
+```
+
+## Compare to Nearest Neighbour Method
+The closest stations to each of the 3 left out needs to be establishsed in order to calculate the nearest neighbour. It should be noted that the closest stations must be taken from the filtered data set, otherwise there is the possiblilty of the selected station also being one of those left out.
+
+```{r}
+excluded_locations <- tibble(
+  name = excluded_stations
+) %>% 
+  left_join(weather) %>% 
+  select(name, lon, lat) %>% 
+  distinct()
+
+filtered_locations <- filtered_pollution %>% 
+  select(name, lon, lat) %>% 
+  distinct()
+
+k_nearest <- 10
+closest_locations <- excluded_locations %>% 
+  pmap(~{
+    # browser()
+    point <- c("lon" = ..2, "lat" = ..3)
+    
+    other_stations <- filtered_locations %>% 
+      select(lon, lat) %>% 
+      as.matrix()
+    
+    min_index <- geosphere::distm(point, other_stations) %>% 
+      which.min()
+    orders <- geosphere::distm(point, other_stations) %>%
+      order() 
+    
+    min_indexes <- which(orders <= k_nearest)
+    
+    closest_station <- filtered_locations %>%
+      slice(min_indexes) %>%
+      pull(name)
+  })
+
+# location_lookup <- tibble(
+#   name = excluded_stations, 
+#   neighbour = closest_locations
+# ) %>% unnest(cols = c(neighbour))
+
+location_lookup <- closest_locations %>% 
+  transpose() %>% 
+  map(as.character) %>% 
+  bind_cols() %>% 
+  `names<-`(glue::glue("neighbour_{1:k_nearest}")) %>% 
+  mutate(name = excluded_stations) %>% 
+  select(name, everything())
+
+```
+
+* Now use this lookup to get the values
+
+
+```{r}
+weather_small <- weather %>% 
+  select(name, date_time, max_temperature)
+
+old_comparison_table <- comparison_data %>%
+  left_join(location_lookup) %>% 
+  select(name, date_time, actual = max_temperature, starts_with("neighbour")) %>%
+  left_join(weather_small, by = c("neighbour_1" = "name", "date_time")) %>% 
+  # left_join(weather_small, by = c("neighbour_2" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_3" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_4" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_5" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_6" = "name", "date_time")) %>% 
+  # left_join(weather_small, by = c("neighbour_7" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_8" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_9" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_10" = "name", "date_time")) %>%
+  pivot_longer(cols = starts_with("max"), names_to = "temperatures") %>% 
+  group_by(name, date_time,  actual) %>% 
+  summarise(predicted = mean(value, na.rm = TRUE)) %>% 
+  mutate(difference = abs(actual-predicted))
+
+
+old_mae <- mean(old_comparison_table$difference, na.rm = TRUE)
+old_mae
+```
+
+
+```{r}
+weather_small <- weather %>% 
+  select(name, date_time, max_temperature)
+
+old_comparison_table <- comparison_data %>%
+  left_join(location_lookup) %>% 
+  select(name, date_time, actual = max_temperature, starts_with("neighbour")) %>%
+  left_join(weather_small, by = c("neighbour_1" = "name", "date_time")) %>% 
+  left_join(weather_small, by = c("neighbour_2" = "name", "date_time")) %>%
+  left_join(weather_small, by = c("neighbour_3" = "name", "date_time")) %>%
+  left_join(weather_small, by = c("neighbour_4" = "name", "date_time")) %>%
+  left_join(weather_small, by = c("neighbour_5" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_6" = "name", "date_time")) %>% 
+  # left_join(weather_small, by = c("neighbour_7" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_8" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_9" = "name", "date_time")) %>%
+  # left_join(weather_small, by = c("neighbour_10" = "name", "date_time")) %>%
+  pivot_longer(cols = starts_with("max"), names_to = "temperatures") %>% 
+  group_by(name, date_time,  actual) %>% 
+  summarise(predicted = mean(value, na.rm = TRUE)) %>% 
+  mutate(difference = abs(actual-predicted))
+
+
+old_mae <- mean(old_comparison_table$difference, na.rm = TRUE)
+old_mae
+```
+

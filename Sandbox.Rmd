@@ -1,0 +1,129 @@
+---
+title: "Sandbox"
+author: "James Monks"
+date: "26/02/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+# Create the cut list
+This is a list of data frames for 
+```{r}
+cut_list <- create_plane() %>% 
+  prep_data() %>% 
+  cut_circle() %>%
+  cut_plane()
+```
+
+
+
+# Create the partitions
+```{r cache=TRUE}
+partitions <- sample_pol %>% create_partition(sim_time(), sim_lon(), sim_lat())
+```
+
+
+# Model the partitions
+```{r}
+models <- partitions %>% 
+  model_partitions(target = o3)
+
+predictions <- models %>% 
+  predict_models() %>% 
+  flatten() %>% 
+  flatten_df() 
+
+final_pred <- weighted.mean(predictions$prediction, w = predictions$weight, na.rm = TRUE)
+```
+
+
+
+# Plot some of the partitions
+```{r}
+a <- partitions[[1]][[4]][[1]]
+
+fit <- loess(o3 ~ dist, data = a, weights = 1/perp_dist)
+fit_data <- fit %>% 
+  broom::augment()
+
+modelr::mae(fit, a)
+
+
+a %>% ggplot(aes(x = dist, y = o3)) +
+  geom_point(aes(colour = perp_dist)) + 
+  geom_ribbon(data = fit_data, aes(x = dist, ymin = .fitted - .se.fit, ymax = .fitted + .se.fit), fill = "grey70", alpha = 0.6) +
+  geom_line(data = fit_data, aes(x = dist, y = .fitted, colour = 1)) + 
+  geom_point(data = modelr::add_predictions(tibble(dist = 0), fit), aes(x = dist, y = pred), colour = "red")
+```
+
+
+# Evaluation
+```{r}
+sim_indexes <- sim_space_time(ppm10 = TRUE)
+results <- sample_pol %>% 
+  eval_split(sim_indexes$space, sim_indexes$time) %>% 
+  eval_model()
+```
+
+
+
+# Process information
+```{r}
+sample_pol %>% 
+  create_partition(n = 2, m = 2) %>% 
+  model_partitions(ppm10 ~ dist, "loess") %>% 
+  predict_value()
+```
+
+
+# Predition of Pollution 
+Take integ csv and predict for these locations given the 
+
+::Note that the current integrated data set does not contain the same dates as in the sample pollution data set, so this will be filled in with dummy values until the actual data has been obtained::
+
+```{r}
+
+# sample_observations <- tibble(
+#   lon = sim_lon(3), 
+#   lat = sim_lat(3),
+#   date_time = sim_time(3)
+# )
+library(lubridate)
+
+sample_observations <- tibble(
+  lon = c(144.8728, 144.8629, 144.8728),
+  lat = c(-37.77839, -37.77839, -37.91356),
+  date_time = c(ymd_hms("2011-05-1401:00:00"), ymd_hms("2011-01-0610:00:00"), ymd_hms("2011-01-0712:00:00"))
+)
+
+```
+
+
+
+```{r}
+sample_observations %>% 
+  pmap(function(lon, lat, date_time){
+    # browser()
+    partitions <- create_partition(sample_pol, date_time, lon, lat)
+    
+    new_partitions <- partitions[[1]] %>%
+      map(~discard(.x, ~nrow(.x) == 0)) %>% discard(~length(.x) == 0)
+    
+    models <- partitions %>% 
+      model_partitions()
+
+    predictions <- models %>% 
+      predict_models() %>% 
+      flatten() %>% 
+      flatten_df() 
+
+    final_pred <- weighted.mean(predictions$prediction, w = predictions$weight, na.rm = TRUE)
+    
+    final_pred
+  })
+```
+

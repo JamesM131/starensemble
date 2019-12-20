@@ -1,0 +1,236 @@
+---
+title: "Evaluation of Station Models"
+author: "James Monks"
+date: "06/08/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+# library(starensemble)
+weather <- readRDS("data-raw/weather.RData")
+
+weather <- weather %>% filter(year >= 1990)
+```
+
+A basic approach to predicting the conditions at a given point based on the surrounding conditions is demonstrated. This is done on the weather data generated from the bomrang package.
+
+## Model Definition
+A model will be created for a point using the values of surrounding stations as predictors. This will be for the closest n stations. 
+
+## Preparation
+The evaluation of the models will be performed through excluding stations from the predictor set and training the model on this station's observations.
+
+The testing data is selected and filtered out. It is uniquely identified by the station name and the time. In this case 3 stations are selected with all times for these stations smpled (to be predicted for).
+```{r}
+excluded_stations <- weather %>%
+  pull(name) %>%
+  unique() %>%
+  sample(3)
+
+
+sample_times <- weather %>%
+  pull(date_time) %>%
+  # unique() %>%
+  sample()
+
+comparison_data <- tibble(date_time = sample_times) %>%
+  mutate(name = sample(excluded_stations, nrow(.), replace = TRUE)) %>%
+  left_join(weather, by = c("date_time", "name")) %>%
+  select(date_time, lon, lat, name, max_temperature) %>%
+  filter(is.na(max_temperature) == FALSE) %>%
+  distinct(date_time, name, .keep_all = TRUE)
+```
+
+This data is split into sections based on the station that is being measured. These will be oprerated on independantly. 
+```{r}
+comparison_data_nested <- comparison_data %>%
+  group_split(name)
+```
+
+
+
+```{r}
+filtered_pollution <- weather %>%
+  filter(!(name %in% excluded_stations))
+
+
+excluded_locations <- tibble(
+  name = excluded_stations
+) %>%
+  left_join(weather) %>%
+  select(name, lon, lat) %>%
+  distinct()
+
+filtered_locations <- filtered_pollution %>%
+  select(name, lon, lat) %>%
+  distinct()
+```
+
+For each of the stations, the 5 nearest neighbouring stations will be identified, and the value at each of these stations will be used as predictor variables. 
+```{r}
+k_nearest <- 5
+closest_locations <- excluded_locations %>%
+  pmap(~ {
+    # browser()
+    point <- c("lon" = ..2, "lat" = ..3)
+
+    other_stations <- filtered_locations %>%
+      select(lon, lat) %>%
+      as.matrix()
+
+    indexes <- geosphere::distm(point, other_stations) %>%
+      order() %>%
+      head(k_nearest)
+
+    closest_station <- filtered_locations %>%
+      slice(indexes) %>%
+      pull(name)
+  })
+
+location_lookup <- closest_locations %>%
+  transpose() %>%
+  map(as.character) %>%
+  bind_cols() %>%
+  `names<-`(glue::glue("neighbour_{1:k_nearest}")) %>%
+  mutate(name = excluded_stations) %>%
+  select(name, everything())
+
+
+weather_small <- weather %>%
+  select(name, date_time, max_temperature)
+```
+
+
+Here the data is just manipulated to get it into a form appropriate for modelling. 
+```{r}
+processed_data <- comparison_data %>%
+  left_join(location_lookup) %>%
+  select(name, date_time, actual = max_temperature, starts_with("neighbour")) %>%
+  pivot_longer(cols = starts_with("neighbour"), names_to = "Neighbour") %>%
+  group_split(Neighbour) %>%
+  map_df(~ {
+    .x %>%
+      left_join(weather_small, by = c("value" = "name", "date_time"))
+  }) %>%
+  pivot_wider(id_cols = c(name, date_time, actual), names_from = Neighbour, values_from = max_temperature)
+```
+
+As with here.
+```{r}
+processed_nested <- comparison_data_nested %>%
+  map_df(~ {
+    .x %>%
+      left_join(location_lookup) %>%
+      select(name, date_time, actual = max_temperature, starts_with("neighbour")) %>%
+      pivot_longer(cols = starts_with("neighbour"), names_to = "Neighbour") %>%
+      group_split(Neighbour) %>%
+      map_df(~ {
+        .x %>%
+          left_join(weather_small, by = c("value" = "name", "date_time"))
+      }) %>%
+      pivot_wider(id_cols = c(name, date_time, actual), names_from = Neighbour, values_from = max_temperature)
+  })
+# mutate(data2 = map(data, ~{
+#   browser()
+#   left_join(.x, location_lookup)
+# }))
+```
+
+## Modelling
+
+Now the modelling code is mapped over each of the stations that have been obtained. It should be noted that an important section of this code selects only those variables that have some complete records. This is because there are some stations that do not record some variables, or at least do not record some variables for long periods of time. This wold break the model as if one variable does not have any records, there will be no whole records left to model on. 
+
+After each of the models has been trained, the fitted and actual values are extracted.
+```{r}
+library(tidymodels)
+
+results <- processed_nested %>%
+  nest(-name) %>%
+  # mutate(data = map(data, ~as.tibble(.x))) %>% 
+  mutate(model = map(data, ~ {
+    # browser()
+    rec <- .x %>%
+      select_if(naniar::any_complete) %>%
+      recipe(actual ~ ., data = .) %>%
+      step_rm(date_time)
+    
+    prepped <- prep(rec)
+    model_data <- juice(prepped)
+
+    lm_fit <- linear_reg() %>%
+      set_engine("lm") %>%
+      fit(formula(prepped), data = model_data)
+  })) %>% 
+  mutate(fitted_data = map(model, ~augment(.x$fit))) %>% 
+  hoist(fitted_data, fitted = ".fitted", actual = "actual")
+  # hoist(data, actual = "actual")
+
+```
+
+## Plotting and Evaluation
+For each of the models, the fitted values can be plotted against the exact values to assess the performance.
+```{r}
+plotted_results <- results %>%
+  mutate(results = map2(actual, fitted, ~ {
+    tibble(
+      actual = .x,
+      fitted = .y
+    )
+  })) %>%
+  mutate(plot = map(results, ~ {
+    ggplot(.x, aes(x = actual, y = fitted)) +
+      geom_point() +
+      geom_smooth(method = "lm")
+  }))
+
+plotted_results %>% 
+  pull(plot)
+
+```
+
+This can be evaluated through a variety of metrics. These are displayed below. 
+
+```{r}
+metric_results <- 
+  plotted_results %>% 
+  mutate(metrics = map(results, metrics, actual, fitted)
+  )
+
+metric_results %>% 
+  pull(metrics)
+```
+
+
+## Coefficient Analysis 
+An interesting analysis in this case is looking into the coefficients assigned to each of the predictor stations. This allows us to see which of the stations are having the biggest impact on the prediction and how they are having this impact.
+
+It should be noted that these coefficients are extracted from a number of different models (in this case 3), trained on data from each of the excluded stations. 
+
+```{r}
+coeffs <- metric_results %>% 
+  pull(model) %>% 
+  map("fit") %>% 
+  map(summary) %>% 
+  map("coefficients") %>% 
+  imap(~tibble(station = .y, term = c("Intercept" ,glue::glue("neighbour_{1:(nrow(.x)-1)}")), estimate = .x[,"Estimate"])) %>% 
+  reduce(bind_rows)
+```
+
+
+```{r}
+coeffs %>% 
+  ggplot(aes(x = term, y = estimate, fill = factor(station))) + 
+  geom_col(position = "Dodge")
+```
+
+It can be seen that the biggest influences are in the intercept ant the first neighbour. This is to be expected as the intercept in this case would represent the average conditions at the station, and the influence of the closest neighbour would be the strongest.
+
+
+## What Next?
+From here it would be interesting to assess whether the information contained inside the coefficients for each of the stations is representative of the distance and the bearing of the neigbour from the original point of prediction. 
+
+If the bearing and distance can be encoporated into the model, the predictions could be generalised to predict the conditions anyhwere within the space (bounded by some minimum distance from predictive stations that would be guided by the data).
+
+It would also be an interesting avenue of investigation to see what the optimal number of included neighbours as predictors is.

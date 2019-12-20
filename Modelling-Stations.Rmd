@@ -1,0 +1,146 @@
+---
+title: "Modelling by Closest Stations"
+author: "James Monks"
+date: "05/08/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+# library(starensemble)
+weather <- readRDS("data-raw/weather.RData")
+
+weather <- weather %>% filter(year >= 1990)
+
+```
+
+
+
+```{r}
+excluded_stations <- weather %>% 
+  pull(name) %>% 
+  unique() %>% 
+  sample(1)
+
+
+sample_times <- weather %>% 
+  pull(date_time) %>% 
+  unique() %>% 
+  sample(700)
+
+comparison_data <- tibble(date_time = sample_times) %>% 
+  mutate(name = sample(excluded_stations, nrow(.), replace = TRUE)) %>% 
+  left_join(weather, by = c("date_time", "name")) %>% 
+  select(date_time, lon, lat, name, max_temperature) %>% 
+  filter(is.na(max_temperature) == FALSE)
+```
+
+
+
+```{r}
+filtered_pollution <- weather %>% 
+  filter(!(name %in% excluded_stations))
+
+
+excluded_locations <- tibble(
+  name = excluded_stations
+) %>% 
+  left_join(weather) %>% 
+  select(name, lon, lat) %>% 
+  distinct()
+
+filtered_locations <- filtered_pollution %>% 
+  select(name, lon, lat) %>% 
+  distinct()
+
+```
+
+
+ 
+```{r}
+k_nearest <- 5
+closest_locations <- excluded_locations %>% 
+  pmap(~{
+    # browser()
+    point <- c("lon" = ..2, "lat" = ..3)
+    
+    other_stations <- filtered_locations %>% 
+      select(lon, lat) %>% 
+      as.matrix()
+
+    indexes <- geosphere::distm(point, other_stations) %>%
+      order() %>% 
+      head(k_nearest)
+    
+    closest_station <- filtered_locations %>%
+      slice(indexes) %>%
+      pull(name)
+  })
+
+location_lookup <- closest_locations %>% 
+  transpose() %>% 
+  map(as.character) %>% 
+  bind_cols() %>% 
+  `names<-`(glue::glue("neighbour_{1:k_nearest}")) %>% 
+  mutate(name = excluded_stations) %>% 
+  select(name, everything())
+
+
+weather_small <- weather %>% 
+  select(name, date_time, max_temperature)
+```
+
+
+```{r}
+processed_data <- comparison_data %>% 
+  left_join(location_lookup) %>% 
+  select(name, date_time, actual = max_temperature, starts_with("neighbour")) %>%
+  pivot_longer(cols = starts_with("neighbour"), names_to = "Neighbour") %>% 
+  group_split(Neighbour) %>% 
+  map_df(~{
+    .x %>% 
+      left_join(weather_small, by = c("value" = "name", "date_time"))
+  }) %>% pivot_wider(id_cols = c(name, date_time, actual), names_from = Neighbour, values_from = max_temperature)
+```
+
+```{r}
+library(tidymodels)
+rec <- processed_data %>% 
+  select_if(naniar::any_complete) %>% 
+  recipe(actual ~ ., data = .) %>% 
+  step_rm(name, date_time) 
+  # step_scale(all_numeric())
+
+prepped <- prep(rec)
+
+model_data <- rec %>% 
+  prep() %>% 
+  juice()
+
+lm_fit <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  fit(formula(prepped), data = model_data) 
+
+
+```
+
+```{r}
+lm_fit$fit %>% 
+  augment() %>% 
+  ggplot(aes(x = actual, y = .fitted)) +
+  geom_point() + 
+  geom_smooth(method = "lm")
+
+```
+
+```{r}
+lm_fit$fit %>% 
+  augment() %>% 
+  metrics(actual, .fitted)
+```
+
+```{r}
+lm_fit$fit %>% summary()
+```
+
