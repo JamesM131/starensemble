@@ -13,3 +13,5 @@ LazyData: true
 Suggests:
     testthat
 RoxygenNote: 6.1.1
+URL: https://github.com/JamesM131/starensemble
+BugReports: https://github.com/JamesM131/starensemble/issues
